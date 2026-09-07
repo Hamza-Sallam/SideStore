@@ -44,97 +44,132 @@ jobs:
 
           text = path.read_text()
 
-          old = r'''        let (data, response): (Data, URLResponse)
-          do {
-              (data, response) = try await session.data(for: request)
-          } catch {
-              debugLog("[SideSign] sendAuthenticationRequest network error: \(error)")
-              throw error
-          }
+          start_marker = (
+              "        let (data, response): "
+              "(Data, URLResponse)\n"
+          )
 
-          let httpResponse = response as? HTTPURLResponse
-          let statusCode = httpResponse?.statusCode ?? 0
-          '''
+          end_marker = (
+              "        guard !data.isEmpty else {\n"
+          )
 
-          new = r'''        // Work around GrandSlam HTTP 503 responses on reused
-          // keep-alive connections. Every attempt gets a fresh connection.
-          let maximumAttempts = 5
-          var finalData: Data?
-          var finalResponse: URLResponse?
+          start = text.find(start_marker)
 
-          for attempt in 0..<maximumAttempts {
-              let attemptSession = URLSession(configuration: .ephemeral)
-
-              let attemptData: Data
-              let attemptResponse: URLResponse
-
-              do {
-                  (attemptData, attemptResponse) =
-                      try await attemptSession.data(for: request)
-                  attemptSession.finishTasksAndInvalidate()
-              } catch {
-                  attemptSession.invalidateAndCancel()
-                  debugLog(
-                      "[SideSign] sendAuthenticationRequest network error: \(error)"
-                  )
-                  throw error
-              }
-
-              let attemptStatusCode =
-                  (attemptResponse as? HTTPURLResponse)?.statusCode ?? 0
-
-              if (500...599).contains(attemptStatusCode),
-                 attempt < maximumAttempts - 1
-              {
-                  let delaySeconds = min(1 << attempt, 8)
-
-                  debugLog(
-                      "[SideSign] GrandSlam HTTP \(attemptStatusCode); " +
-                      "retrying on fresh connection in \(delaySeconds)s"
-                  )
-
-                  try await Task.sleep(
-                      nanoseconds:
-                          UInt64(delaySeconds) * 1_000_000_000
-                  )
-
-                  continue
-              }
-
-              finalData = attemptData
-              finalResponse = attemptResponse
-              break
-          }
-
-          guard let data = finalData,
-                let response = finalResponse
-          else {
-              throw URLError(.badServerResponse)
-          }
-
-          let httpResponse = response as? HTTPURLResponse
-          let statusCode = httpResponse?.statusCode ?? 0
-
-          if (500...599).contains(statusCode) {
-              throw ServerError.badServerResponse(
-                  reason:
-                      "GrandSlam returned HTTP \(statusCode) after " +
-                      "\(maximumAttempts) attempts",
-                  jsonPayload: "\(data.count) bytes"
-              )
-          }
-          '''
-
-          if text.count(old) != 1:
+          if start == -1:
               raise SystemExit(
-                  f"Patch anchor mismatch: expected 1 match, "
-                  f"found {text.count(old)}"
+                  "Could not locate beginning of "
+                  "sendAuthenticationRequest network block"
               )
 
-          path.write_text(text.replace(old, new))
-          print("GrandSlam 503 patch applied successfully.")
-          PY
+          end = text.find(end_marker, start)
 
+          if end == -1:
+              raise SystemExit(
+                  "Could not locate end of "
+                  "sendAuthenticationRequest network block"
+              )
+
+          lines = [
+              "        // GrandSlam 503 workaround.",
+              "        // Give every request its own URLSession.",
+              "        let maximumAttempts = 5",
+              "        var finalData: Data?",
+              "        var finalResponse: URLResponse?",
+              "",
+              "        for attempt in 0..<maximumAttempts {",
+              "            let attemptSession = URLSession(",
+              "                configuration: .ephemeral",
+              "            )",
+              "",
+              "            do {",
+              "                let (attemptData, attemptResponse) =",
+              "                    try await attemptSession.data(",
+              "                        for: request",
+              "                    )",
+              "",
+              "                attemptSession.finishTasksAndInvalidate()",
+              "",
+              "                let attemptStatusCode =",
+              "                    (attemptResponse as? HTTPURLResponse)?",
+              "                        .statusCode ?? 0",
+              "",
+              "                if (500...599).contains(",
+              "                    attemptStatusCode",
+              "                ) && attempt < maximumAttempts - 1 {",
+              "                    let delaySeconds = min(",
+              "                        1 << attempt,",
+              "                        8",
+              "                    )",
+              "",
+              "                    debugLog(",
+              "                        \"[SideSign] GrandSlam HTTP \" +",
+              "                        \"\\(attemptStatusCode); \" +",
+              "                        \"retrying on fresh connection\"",
+              "                    )",
+              "",
+              "                    try await Task.sleep(",
+              "                        nanoseconds:",
+              "                            UInt64(delaySeconds) *",
+              "                            1_000_000_000",
+              "                    )",
+              "",
+              "                    continue",
+              "                }",
+              "",
+              "                finalData = attemptData",
+              "                finalResponse = attemptResponse",
+              "                break",
+              "            } catch {",
+              "                attemptSession.invalidateAndCancel()",
+              "                debugLog(",
+              "                    \"[SideSign] auth network error: \" +",
+              "                    \"\\(error)\"",
+              "                )",
+              "                throw error",
+              "            }",
+              "        }",
+              "",
+              "        guard let data = finalData,",
+              "              let response = finalResponse else {",
+              "            throw URLError(.badServerResponse)",
+              "        }",
+              "",
+              "        let httpResponse =",
+              "            response as? HTTPURLResponse",
+              "",
+              "        let statusCode =",
+              "            httpResponse?.statusCode ?? 0",
+              "",
+              "        if (500...599).contains(statusCode) {",
+              "            throw ServerError.badServerResponse(",
+              "                reason:",
+              "                    \"GrandSlam returned HTTP \" +",
+              "                    \"\\(statusCode) after \" +",
+              "                    \"\\(maximumAttempts) attempts\",",
+              "                jsonPayload:",
+              "                    \"\\(data.count) bytes\"",
+              "            )",
+              "        }",
+              ""
+          ]
+
+          replacement = "\n".join(lines) + "\n"
+
+          new_text = (
+              text[:start] +
+              replacement +
+              text[end:]
+          )
+
+          path.write_text(new_text)
+
+          if "URLSession(configuration: .ephemeral)" in new_text:
+              print("GrandSlam fresh-session patch applied.")
+          elif "configuration: .ephemeral" in new_text:
+              print("GrandSlam fresh-session patch applied.")
+          else:
+              raise SystemExit("Patch verification failed.")
+          PY
       - name: Verify patch
         run: |
           grep -q 'URLSession(configuration: .ephemeral)' \
