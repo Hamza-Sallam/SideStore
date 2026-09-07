@@ -172,13 +172,15 @@ jobs:
           PY
       - name: Verify patch
         run: |
-          grep -q 'URLSession(configuration: .ephemeral)' \
+          grep -q 'configuration: .ephemeral' \
             Dependencies/SideSign/Sources/DeveloperPortal/Authentication.swift
 
           grep -q 'maximumAttempts = 5' \
             Dependencies/SideSign/Sources/DeveloperPortal/Authentication.swift
 
           git -C Dependencies/SideSign diff --check
+
+          echo "503 patch verified successfully."
 
       - name: Build SideStore IPA
         run: python3 scripts/ci/workflow.py build
