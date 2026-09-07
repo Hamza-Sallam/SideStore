@@ -1,0 +1,160 @@
+name: Build SideStore 503 Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - develop
+    paths:
+      - '.github/workflows/build-503-fix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build patched SideStore IPA
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout SideStore
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up Xcode 26.2
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: '26.2'
+
+      - name: Install build tools
+        run: brew install ldid xcbeautify
+
+      - name: Patch SideSign GrandSlam requests
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "Dependencies/SideSign/"
+              "Sources/DeveloperPortal/Authentication.swift"
+          )
+
+          text = path.read_text()
+
+          old = r'''        let (data, response): (Data, URLResponse)
+          do {
+              (data, response) = try await session.data(for: request)
+          } catch {
+              debugLog("[SideSign] sendAuthenticationRequest network error: \(error)")
+              throw error
+          }
+
+          let httpResponse = response as? HTTPURLResponse
+          let statusCode = httpResponse?.statusCode ?? 0
+          '''
+
+          new = r'''        // Work around GrandSlam HTTP 503 responses on reused
+          // keep-alive connections. Every attempt gets a fresh connection.
+          let maximumAttempts = 5
+          var finalData: Data?
+          var finalResponse: URLResponse?
+
+          for attempt in 0..<maximumAttempts {
+              let attemptSession = URLSession(configuration: .ephemeral)
+
+              let attemptData: Data
+              let attemptResponse: URLResponse
+
+              do {
+                  (attemptData, attemptResponse) =
+                      try await attemptSession.data(for: request)
+                  attemptSession.finishTasksAndInvalidate()
+              } catch {
+                  attemptSession.invalidateAndCancel()
+                  debugLog(
+                      "[SideSign] sendAuthenticationRequest network error: \(error)"
+                  )
+                  throw error
+              }
+
+              let attemptStatusCode =
+                  (attemptResponse as? HTTPURLResponse)?.statusCode ?? 0
+
+              if (500...599).contains(attemptStatusCode),
+                 attempt < maximumAttempts - 1
+              {
+                  let delaySeconds = min(1 << attempt, 8)
+
+                  debugLog(
+                      "[SideSign] GrandSlam HTTP \(attemptStatusCode); " +
+                      "retrying on fresh connection in \(delaySeconds)s"
+                  )
+
+                  try await Task.sleep(
+                      nanoseconds:
+                          UInt64(delaySeconds) * 1_000_000_000
+                  )
+
+                  continue
+              }
+
+              finalData = attemptData
+              finalResponse = attemptResponse
+              break
+          }
+
+          guard let data = finalData,
+                let response = finalResponse
+          else {
+              throw URLError(.badServerResponse)
+          }
+
+          let httpResponse = response as? HTTPURLResponse
+          let statusCode = httpResponse?.statusCode ?? 0
+
+          if (500...599).contains(statusCode) {
+              throw ServerError.badServerResponse(
+                  reason:
+                      "GrandSlam returned HTTP \(statusCode) after " +
+                      "\(maximumAttempts) attempts",
+                  jsonPayload: "\(data.count) bytes"
+              )
+          }
+          '''
+
+          if text.count(old) != 1:
+              raise SystemExit(
+                  f"Patch anchor mismatch: expected 1 match, "
+                  f"found {text.count(old)}"
+              )
+
+          path.write_text(text.replace(old, new))
+          print("GrandSlam 503 patch applied successfully.")
+          PY
+
+      - name: Verify patch
+        run: |
+          grep -q 'URLSession(configuration: .ephemeral)' \
+            Dependencies/SideSign/Sources/DeveloperPortal/Authentication.swift
+
+          grep -q 'maximumAttempts = 5' \
+            Dependencies/SideSign/Sources/DeveloperPortal/Authentication.swift
+
+          git -C Dependencies/SideSign diff --check
+
+      - name: Build SideStore IPA
+        run: python3 scripts/ci/workflow.py build
+
+      - name: Rename IPA
+        run: mv SideStore.ipa SideStore-503-fix.ipa
+
+      - name: Upload patched IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-503-fix
+          path: SideStore-503-fix.ipa
+          if-no-files-found: error
+          retention-days: 7
