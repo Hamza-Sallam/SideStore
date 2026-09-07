@@ -31,6 +31,89 @@ jobs:
       - name: Install build tools
         run: brew install ldid xcbeautify
 
+      - name: Prepare local SideSign dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf local/CodeSignKit local/GSACryptoKit
+          mkdir -p local
+
+          clone_at() {
+            local url="$1"
+            local sha="$2"
+            local dir="$3"
+            git init -q "$dir"
+            git -C "$dir" remote add origin "$url"
+            git -C "$dir" fetch --depth=1 origin "$sha"
+            git -C "$dir" checkout -q --detach FETCH_HEAD
+          }
+
+          clone_at \
+            https://github.com/mahee96/CodeSignKit.git \
+            15f95c1f13e3b48727c17b3b4e23e4d06917abb8 \
+            local/CodeSignKit
+
+          clone_at \
+            https://github.com/mahee96/GSACryptoKit.git \
+            e7dd1055d684a62456de8c382e14743f06e6ecba \
+            local/GSACryptoKit
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          sidesign = Path('Dependencies/SideSign/Package.swift')
+          text = sidesign.read_text()
+
+          replacements = [
+              (
+                  r'\.package\(url:\s*"https://github\.com/mahee96/CodeSignKit\.git",\s*branch:\s*"main"\),',
+                  '.package(name: "CodeSignKit", path: "../../local/CodeSignKit"),'
+              ),
+              (
+                  r'\.package\(url:\s*"https://github\.com/mahee96/GSACryptoKit\.git",\s*branch:\s*"main"\),',
+                  '.package(name: "GSACryptoKit", path: "../../local/GSACryptoKit"),'
+              ),
+          ]
+
+          for pattern, replacement in replacements:
+              text, count = re.subn(pattern, replacement, text, count=1)
+              if count != 1:
+                  raise SystemExit(f'Failed to patch SideSign dependency: {pattern}')
+
+          sidesign.write_text(text)
+
+          # CodeSignKit and GSACryptoKit only use OpenSSL for their tests.
+          # Removing those test-only binary targets prevents SwiftPM from
+          # racing multiple downloads of the identical OpenSSL artifact.
+          block = re.compile(
+              r'#if canImport\(Darwin\)\s*'
+              r'let openSSLBinaryTargets: \[Target\] = \[.*?\]\s*'
+              r'let openSSLTestDependencies: \[Target\.Dependency\] = \[.*?\]\s*'
+              r'#else\s*'
+              r'let openSSLBinaryTargets: \[Target\] = \[\]\s*'
+              r'let openSSLTestDependencies: \[Target\.Dependency\] = \[\]\s*'
+              r'#endif',
+              re.S,
+          )
+
+          replacement = '''let openSSLBinaryTargets: [Target] = []
+          let openSSLTestDependencies: [Target.Dependency] = []'''
+
+          for manifest in [
+              Path('local/CodeSignKit/Package.swift'),
+              Path('local/GSACryptoKit/Package.swift'),
+          ]:
+              data = manifest.read_text()
+              data, count = block.subn(replacement, data, count=1)
+              if count != 1:
+                  raise SystemExit(f'Failed to remove test-only OpenSSL target from {manifest}')
+              manifest.write_text(data)
+
+          print('Local dependency/OpenSSL race workaround applied.')
+          PY
+
       - name: Patch SideSign GrandSlam requests
         shell: bash
         run: |
@@ -38,186 +121,128 @@ jobs:
           from pathlib import Path
 
           path = Path(
-              "Dependencies/SideSign/"
-              "Sources/DeveloperPortal/Authentication.swift"
+              'Dependencies/SideSign/'
+              'Sources/DeveloperPortal/Authentication.swift'
           )
-
           text = path.read_text()
 
-          start_marker = (
-              "        let (data, response): "
-              "(Data, URLResponse)\n"
-          )
-
-          end_marker = (
-              "        guard !data.isEmpty else {\n"
-          )
+          start_marker = '        let (data, response): (Data, URLResponse)\n'
+          end_marker = '        guard !data.isEmpty else {\n'
 
           start = text.find(start_marker)
-
           if start == -1:
-              raise SystemExit(
-                  "Could not locate beginning of "
-                  "sendAuthenticationRequest network block"
-              )
+              raise SystemExit('Could not locate authentication network block start')
 
           end = text.find(end_marker, start)
-
           if end == -1:
-              raise SystemExit(
-                  "Could not locate end of "
-                  "sendAuthenticationRequest network block"
+              raise SystemExit('Could not locate authentication network block end')
+
+          replacement = r'''        // GrandSlam 503 workaround: do not reuse keep-alive sessions.
+          let maximumAttempts = 5
+          var finalData: Data?
+          var finalResponse: URLResponse?
+
+          for attempt in 0..<maximumAttempts {
+              let attemptSession = URLSession(configuration: .ephemeral)
+
+              do {
+                  let (attemptData, attemptResponse) = try await attemptSession.data(for: request)
+                  attemptSession.finishTasksAndInvalidate()
+
+                  let attemptStatusCode = (attemptResponse as? HTTPURLResponse)?.statusCode ?? 0
+
+                  if (500...599).contains(attemptStatusCode), attempt < maximumAttempts - 1 {
+                      let delaySeconds = min(1 << attempt, 8)
+                      debugLog("[SideSign] GrandSlam HTTP \(attemptStatusCode); retrying on a fresh connection")
+                      try await Task<Never, Never>.sleep(
+                          nanoseconds: UInt64(delaySeconds) * 1_000_000_000
+                      )
+                      continue
+                  }
+
+                  finalData = attemptData
+                  finalResponse = attemptResponse
+                  break
+              } catch {
+                  attemptSession.invalidateAndCancel()
+                  debugLog("[SideSign] sendAuthenticationRequest network error: \(error)")
+                  throw error
+              }
+          }
+
+          guard let data = finalData, let response = finalResponse else {
+              throw URLError(.badServerResponse)
+          }
+
+          let httpResponse = response as? HTTPURLResponse
+          let statusCode = httpResponse?.statusCode ?? 0
+
+          if (500...599).contains(statusCode) {
+              throw ServerError.badServerResponse(
+                  reason: "GrandSlam returned HTTP \(statusCode) after \(maximumAttempts) attempts",
+                  jsonPayload: "\(data.count) bytes"
               )
+          }
 
-          lines = [
-              "        // GrandSlam 503 workaround.",
-              "        // Give every request its own URLSession.",
-              "        let maximumAttempts = 5",
-              "        var finalData: Data?",
-              "        var finalResponse: URLResponse?",
-              "",
-              "        for attempt in 0..<maximumAttempts {",
-              "            let attemptSession = URLSession(",
-              "                configuration: .ephemeral",
-              "            )",
-              "",
-              "            do {",
-              "                let (attemptData, attemptResponse) =",
-              "                    try await attemptSession.data(",
-              "                        for: request",
-              "                    )",
-              "",
-              "                attemptSession.finishTasksAndInvalidate()",
-              "",
-              "                let attemptStatusCode =",
-              "                    (attemptResponse as? HTTPURLResponse)?",
-              "                        .statusCode ?? 0",
-              "",
-              "                if (500...599).contains(",
-              "                    attemptStatusCode",
-              "                ) && attempt < maximumAttempts - 1 {",
-              "                    let delaySeconds = min(",
-              "                        1 << attempt,",
-              "                        8",
-              "                    )",
-              "",
-              "                    debugLog(",
-              "                        \"[SideSign] GrandSlam HTTP \" +",
-              "                        \"\\(attemptStatusCode); \" +",
-              "                        \"retrying on fresh connection\"",
-              "                    )",
-              "",
-              "                    try await Task.sleep(",
-              "                        nanoseconds:",
-              "                            UInt64(delaySeconds) *",
-              "                            1_000_000_000",
-              "                    )",
-              "",
-              "                    continue",
-              "                }",
-              "",
-              "                finalData = attemptData",
-              "                finalResponse = attemptResponse",
-              "                break",
-              "            } catch {",
-              "                attemptSession.invalidateAndCancel()",
-              "                debugLog(",
-              "                    \"[SideSign] auth network error: \" +",
-              "                    \"\\(error)\"",
-              "                )",
-              "                throw error",
-              "            }",
-              "        }",
-              "",
-              "        guard let data = finalData,",
-              "              let response = finalResponse else {",
-              "            throw URLError(.badServerResponse)",
-              "        }",
-              "",
-              "        let httpResponse =",
-              "            response as? HTTPURLResponse",
-              "",
-              "        let statusCode =",
-              "            httpResponse?.statusCode ?? 0",
-              "",
-              "        if (500...599).contains(statusCode) {",
-              "            throw ServerError.badServerResponse(",
-              "                reason:",
-              "                    \"GrandSlam returned HTTP \" +",
-              "                    \"\\(statusCode) after \" +",
-              "                    \"\\(maximumAttempts) attempts\",",
-              "                jsonPayload:",
-              "                    \"\\(data.count) bytes\"",
-              "            )",
-              "        }",
-              ""
-          ]
+          '''
 
-          replacement = "\n".join(lines) + "\n"
-
-          new_text = (
-              text[:start] +
-              replacement +
-              text[end:]
-          )
-
-          path.write_text(new_text)
-
-          if "configuration: .ephemeral" in new_text:
-              print("GrandSlam fresh-session patch applied.")
-          else:
-              raise SystemExit("Patch verification failed.")
+          path.write_text(text[:start] + replacement + text[end:])
+          print('GrandSlam fresh-session patch applied.')
           PY
 
-      - name: Verify patch
+      - name: Verify patches
+        shell: bash
         run: |
+          set -euo pipefail
           grep -q 'configuration: .ephemeral' \
             Dependencies/SideSign/Sources/DeveloperPortal/Authentication.swift
-
           grep -q 'maximumAttempts = 5' \
             Dependencies/SideSign/Sources/DeveloperPortal/Authentication.swift
-
+          grep -q '../../local/CodeSignKit' Dependencies/SideSign/Package.swift
+          grep -q '../../local/GSACryptoKit' Dependencies/SideSign/Package.swift
+          ! grep -q 'OpenSSL.xcframework.zip' local/CodeSignKit/Package.swift
+          ! grep -q 'OpenSSL.xcframework.zip' local/GSACryptoKit/Package.swift
           git -C Dependencies/SideSign diff --check
+          echo 'All patches verified.'
 
-          echo "503 patch verified successfully."
+      - name: Clean package caches
+        shell: bash
+        run: |
+          rm -rf "$HOME/Library/Caches/org.swift.swiftpm"
+          rm -rf "$HOME/Library/org.swift.swiftpm"
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
 
       - name: Resolve Swift packages
         shell: bash
         run: |
           set -o pipefail
-
           for attempt in 1 2 3; do
             echo "Package resolution attempt $attempt/3"
-
             if xcodebuild \
               -resolvePackageDependencies \
               -project AltStore.xcodeproj \
               -scheme SideStore \
-              2>&1 | tee package-resolution.log
-            then
-              echo "Package resolution succeeded."
+              2>&1 | tee package-resolution.log; then
+              echo 'Package resolution succeeded.'
               exit 0
             fi
 
-            echo "Package resolution failed."
-
             if [ "$attempt" -lt 3 ]; then
-              rm -rf ~/Library/Caches/org.swift.swiftpm
-              rm -rf ~/Library/Developer/Xcode/DerivedData
+              rm -rf "$HOME/Library/Caches/org.swift.swiftpm"
+              rm -rf "$HOME/Library/org.swift.swiftpm"
+              rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
               sleep $((attempt * 10))
             fi
           done
 
-          echo "Package resolution failed after 3 attempts."
+          echo 'Package resolution failed after 3 attempts.'
           exit 1
 
       - name: Build SideStore IPA
-        run: |
-          python3 scripts/ci/workflow.py build
+        run: python3 scripts/ci/workflow.py build
 
       - name: Rename IPA
-        run: |
-          mv SideStore.ipa SideStore-503-fix.ipa
+        run: mv SideStore.ipa SideStore-503-fix.ipa
 
       - name: Upload patched IPA
         uses: actions/upload-artifact@v4
