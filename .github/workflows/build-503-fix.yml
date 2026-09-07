@@ -163,13 +163,12 @@ jobs:
 
           path.write_text(new_text)
 
-          if "URLSession(configuration: .ephemeral)" in new_text:
-              print("GrandSlam fresh-session patch applied.")
-          elif "configuration: .ephemeral" in new_text:
+          if "configuration: .ephemeral" in new_text:
               print("GrandSlam fresh-session patch applied.")
           else:
               raise SystemExit("Patch verification failed.")
           PY
+
       - name: Verify patch
         run: |
           grep -q 'configuration: .ephemeral' \
@@ -182,11 +181,43 @@ jobs:
 
           echo "503 patch verified successfully."
 
+      - name: Resolve Swift packages
+        shell: bash
+        run: |
+          set -o pipefail
+
+          for attempt in 1 2 3; do
+            echo "Package resolution attempt $attempt/3"
+
+            if xcodebuild \
+              -resolvePackageDependencies \
+              -project AltStore.xcodeproj \
+              -scheme SideStore \
+              2>&1 | tee package-resolution.log
+            then
+              echo "Package resolution succeeded."
+              exit 0
+            fi
+
+            echo "Package resolution failed."
+
+            if [ "$attempt" -lt 3 ]; then
+              rm -rf ~/Library/Caches/org.swift.swiftpm
+              rm -rf ~/Library/Developer/Xcode/DerivedData
+              sleep $((attempt * 10))
+            fi
+          done
+
+          echo "Package resolution failed after 3 attempts."
+          exit 1
+
       - name: Build SideStore IPA
-        run: python3 scripts/ci/workflow.py build
+        run: |
+          python3 scripts/ci/workflow.py build
 
       - name: Rename IPA
-        run: mv SideStore.ipa SideStore-503-fix.ipa
+        run: |
+          mv SideStore.ipa SideStore-503-fix.ipa
 
       - name: Upload patched IPA
         uses: actions/upload-artifact@v4
